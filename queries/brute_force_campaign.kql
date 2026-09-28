@@ -1,0 +1,40 @@
+// ============================================================
+// Query: Entra ID brute-force / password-spray campaign detection
+// Purpose: Surface source IPs generating abnormal failed-sign-in
+//          volumes, including low-and-slow password spraying that
+//          stays under per-account lockout thresholds.
+// Data source: SigninLogs (requires Entra ID P1 or later)
+// Logic: Bucket failed interactive sign-ins by (IP, hour). Flag an IP
+//        when it exceeds EITHER a raw failure count (brute force) OR a
+//        distinct-targeted-user count (spraying). dcount on
+//        UserPrincipalName is what separates spraying from guessing.
+// Tuning: failureThreshold / sprayThreshold below. Raise them in large
+//         tenants; scope AppDisplayName to VPN/Exchange Online for focus.
+// MITRE ATT&CK: T1110.001 (Password Guessing), T1110.003 (Password Spraying)
+// Investigation steps:
+//   1. Check whether the IP belongs to a known scanner, VPN egress, or
+//      corporate NAT before treating it as hostile.
+//   2. Pivot: same IP in the last 30d — is this a repeat offender?
+//   3. For targeted users: force password reset + revoke sessions if any
+//      success (ResultType == 0) appears from the same IP.
+//   4. If spraying succeeded, hunt for follow-on activity (consent grants,
+//      mailbox rules) for the compromised accounts.
+// ============================================================
+let failureThreshold = 50;   // brute-force: failures per IP per hour
+let sprayThreshold = 10;     // spraying: distinct users targeted per IP per hour
+SigninLogs
+| where TimeGenerated > ago(24h)
+| where ResultType != 0  // 0 = success; everything else is a failure code
+| summarize
+    FailedAttempts = count(),
+    TargetedUsers = dcount(UserPrincipalName),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    SampleErrors = make_set(ResultDescription, 3),
+    TargetedApps = make_set(AppDisplayName, 5)
+    by IPAddress, Hour = bin(TimeGenerated, 1h)
+| where FailedAttempts > failureThreshold or TargetedUsers > sprayThreshold
+| extend DurationMinutes = datetime_diff("minute", LastSeen, FirstSeen)
+| project Hour, IPAddress, FailedAttempts, TargetedUsers, DurationMinutes,
+          TargetedApps, SampleErrors
+| order by FailedAttempts desc

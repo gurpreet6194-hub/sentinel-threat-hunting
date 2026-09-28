@@ -1,0 +1,41 @@
+// ============================================================
+// Query: Anomalous outbound data volume per device (possible exfiltration)
+// Purpose: Catch a device sending far more data than its own baseline,
+//          a common last step before or during data theft.
+// Data source: DeviceNetworkEvents (Defender for Endpoint)
+// Logic: Build a per-device daily baseline of bytes sent over the prior
+//        7 days, then compare yesterday's total against it. Flags only
+//        when yesterday exceeds 3x the baseline AND the baseline is
+//        non-trivial, which suppresses always-chatty servers.
+// Tuning: sensitivityMultiplier (default 3.0). Exclude backup/EDR-update
+//         hosts via a watchlist if they dominate results. avgif/sumif
+//         keep the whole computation in a single pass.
+// MITRE ATT&CK: T1041 (Exfiltration Over C2 Channel),
+//               T1048 (Exfiltration Over Alternative Protocol)
+// Investigation steps:
+//   1. Identify the remote IPs/domains behind the spike:
+//      DeviceNetworkEvents | where DeviceName == "<host>" | summarize
+//      sum(SentBytes) by RemoteIP, RemoteUrl | top 10.
+//   2. Check the initiating process (InitiatingProcessFileName) —
+//      archivers (7z, rar), cloud clients, or LOLBins deserve scrutiny.
+//   3. Correlate with DeviceFileEvents for bulk reads/staging beforehand.
+//   4. If malicious: isolate the device (Defender action) and preserve
+//      the process tree before remediation.
+// ============================================================
+let sensitivityMultiplier = 3.0;
+DeviceNetworkEvents
+| where TimeGenerated > ago(8d)
+| where ActionType == "ConnectionSuccess"
+| where isnotempty(RemoteIP)
+| summarize DailySentBytes = sum(SentBytes)
+    by DeviceName, Day = bin(TimeGenerated, 1d)
+| summarize
+    BaselineAvg = avgif(DailySentBytes, Day < startofday(ago(1d))),
+    YesterdaySent = sumif(DailySentBytes, Day == startofday(ago(1d)))
+    by DeviceName
+| where isnotempty(BaselineAvg) and BaselineAvg > 0
+| where YesterdaySent > BaselineAvg * sensitivityMultiplier
+| extend Ratio = round(YesterdaySent / BaselineAvg, 1)
+| project DeviceName, YesterdaySentBytes = YesterdaySent,
+          BaselineAvgBytes = round(BaselineAvg, 0), Ratio
+| order by Ratio desc

@@ -1,0 +1,37 @@
+// ============================================================
+// Query: New admin consent grants to applications (rogue OAuth apps)
+// Purpose: Detect when an admin (or a phished admin) grants a third-party
+//          application tenant-wide permissions — the classic malicious
+//          OAuth-app persistence technique after a consent-phishing attack.
+// Data source: AuditLogs (Entra ID)
+// Logic: Audit operations that create consent or app role assignments,
+//        enriched with the target application name and the acting admin.
+//        Ordered newest-first for triage.
+// Tuning: Alert on ANY hit in production via an Analytics rule; rare in
+//         healthy tenants. Maintain an allowlist of approved enterprise
+//         apps to cut noise.
+// MITRE ATT&CK: T1550.001 (Application Access Token),
+//               T1136 (Create Account: Cloud Account — via app)
+// Investigation steps:
+//   1. Open the app in Entra admin center: check publisher verification,
+//      requested API permissions (Mail.ReadWrite / Files.ReadWrite.All /
+//      Directory.ReadWrite.All are the dangerous ones), and creation date.
+//   2. If unverified or over-permissioned: revoke consent immediately,
+//      then hunt for what the app touched (AuditLogs, OfficeActivity,
+//      CloudAppEvents filtered by the app's service principal).
+//   3. Review the granting admin's own sign-ins for compromise.
+// ============================================================
+AuditLogs
+| where TimeGenerated > ago(7d)
+| where OperationName in (
+    "Consent to application",                 // admin consent workflow
+    "Add app role assignment to service principal",
+    "Add delegated permission grant")
+| extend
+    AppName = tostring(TargetResources[0].displayName),
+    AppId = tostring(TargetResources[0].id),
+    GrantingAdmin = tostring(InitiatedBy.user.userPrincipalName),
+    AdminIp = tostring(InitiatedBy.user.ipAddress)
+| project TimeGenerated, OperationName, AppName, AppId,
+          GrantingAdmin, AdminIp, Result = ResultDescription
+| order by TimeGenerated desc

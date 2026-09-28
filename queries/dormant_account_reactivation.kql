@@ -1,0 +1,38 @@
+// ============================================================
+// Query: Dormant account reactivation (possible account takeover)
+// Purpose: Find accounts that signed in successfully in the last 7 days
+//          after 90+ days of silence — a hallmark of credential theft,
+//          stale service accounts being abused, or insider reactivation.
+// Data source: SigninLogs (Entra ID)
+// Logic: Anti-join — accounts present in the recent window but absent
+//        from the preceding dormancy window. leftouter join + isempty
+//        is the idiomatic KQL pattern for "appeared, but not before".
+// Tuning: dormancy (default 90d). Service accounts with scheduled jobs
+//         will recur here; exclude them via a watchlist of known
+//         service principals after the first review.
+// MITRE ATT&CK: T1078 (Valid Accounts)
+// Investigation steps:
+//   1. Check the sign-in details: unfamiliar IP / ASN / location / device?
+//   2. Was MFA satisfied? A dormant account suddenly passing MFA is
+//      high severity — check AuthenticationDetails for MFA method.
+//   3. Look at what the account did after signing in (AuditLogs by the
+//      same UPN, ±2h).
+//   4. If compromised: reset password, revoke refresh tokens, and review
+//      why the account still existed (deprovisioning gap).
+// ============================================================
+let dormancy = 90d;
+let recentWindow = 7d;
+let recent =
+    SigninLogs
+    | where TimeGenerated > ago(recentWindow)
+    | where ResultType == 0  // successful sign-ins only
+    | summarize RecentSignIn = max(TimeGenerated) by UserPrincipalName;
+let prior =
+    SigninLogs
+    | where TimeGenerated between (ago(recentWindow + dormancy) .. ago(recentWindow))
+    | summarize PriorSignIn = max(TimeGenerated) by UserPrincipalName;
+recent
+| join kind=leftouter (prior) on UserPrincipalName
+| where isempty(PriorSignIn)  // no sign-in during the dormancy window
+| project UserPrincipalName, RecentSignIn
+| order by RecentSignIn desc
